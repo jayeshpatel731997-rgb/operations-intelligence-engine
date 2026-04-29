@@ -7,15 +7,25 @@ import KPICard from '../components/KPICard.jsx';
 import LossChart from '../components/LossChart.jsx';
 import OEEChart from '../components/OEEChart.jsx';
 
-const BASE_URL = "https://operations-intelligence-engine.onrender.com";
+const API_URL = import.meta.env.VITE_API_URL || "https://operations-intelligence-engine.onrender.com";
+
+console.log("API URL:", import.meta.env.VITE_API_URL);
+
+const WS_PATH = '/ws';
+const WS_URL = normalizeWebSocketUrl(import.meta.env.VITE_WS_URL, API_URL);
 
 const getSummary = async () => {
-  const res = await fetch(`${BASE_URL}/ai-summary`);
+  const res = await fetch(`${API_URL}/ai-summary`);
+  return await res.json();
+};
+
+const getDecision = async () => {
+  const res = await fetch(`${API_URL}/ai-decision`);
   return await res.json();
 };
 
 const getLosses = async () => {
-  const res = await fetch(`${BASE_URL}/loss`);
+  const res = await fetch(`${API_URL}/loss`);
   return await res.json();
 };
 
@@ -44,7 +54,11 @@ function createWebSocketUrl(apiBase) {
     url.hash = '';
     return url.toString();
   } catch {
-    return `ws://localhost:8000${WS_PATH}`;
+    // Fallback to API_URL derived WebSocket URL
+    const fallbackUrl = new URL(API_URL);
+    fallbackUrl.protocol = fallbackUrl.protocol === 'https:' ? 'wss:' : 'ws:';
+    fallbackUrl.pathname = WS_PATH;
+    return fallbackUrl.toString();
   }
 }
 
