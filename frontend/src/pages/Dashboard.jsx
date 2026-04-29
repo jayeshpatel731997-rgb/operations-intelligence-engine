@@ -300,7 +300,7 @@ export default function Dashboard() {
           <DecisionPanel decision={streamData.decision} anomaly={streamData.anomaly} />
         </section>
 
-        <footer className="text-center text-gray-500 mt-10">
+        <footer className="mt-10 text-center text-gray-500">
           Built by Jayesh Patel | Supply Chain Analytics
         </footer>
       </div>
