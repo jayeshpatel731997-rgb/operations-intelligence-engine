@@ -4,6 +4,17 @@
 
 Operations Intelligence Control Tower is a real-time manufacturing dashboard for monitoring operational performance, production losses, anomalies, and AI-generated decision recommendations.
 
+This system simulates a real-time industrial analytics platform used in manufacturing environments.
+
+Key capabilities:
+- Ingests operational data (CSV or simulated stream)
+- Calculates OEE and identifies performance losses
+- Detects anomalies in machine behavior
+- Quantifies financial impact of operational inefficiencies
+- Generates AI-driven recommendations for maintenance and process improvement
+
+Designed to mimic real-world plant decision systems where engineers monitor production, detect issues, and take immediate action.
+
 ## Features
 
 - OEE monitoring with Availability, Performance, Quality, and overall OEE metrics

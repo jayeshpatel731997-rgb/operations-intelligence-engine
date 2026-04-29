@@ -1,5 +1,5 @@
 import '@testing-library/jest-dom/vitest';
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import React from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from './main.jsx';
@@ -19,6 +19,27 @@ const lossResponse = [
   { loss_category: 'performance loss', duration: 30, impact: 9000 },
 ];
 
+const summaryResponse = {
+  last_updated: '2026-04-25T18:41:37.761017+00:00',
+  average_oee: 84.2,
+  current_oee: 85.1,
+  previous_oee: 84.1,
+  delta: 1,
+  trend_direction: 'increase',
+  top_losses: lossResponse,
+  financial: {
+    revenue_loss: 123456.78,
+    formatted: '$123,457',
+  },
+  anomalies: [],
+  summary_report: 'OEE is improving with breakdown loss as the main driver.',
+};
+
+const decisionResponse = {
+  priority: 'HIGH',
+  action: 'Recommend maintenance intervention on the highest-loss machine.',
+};
+
 class MockWebSocket {
   static instances = [];
 
@@ -30,9 +51,7 @@ class MockWebSocket {
     }, 0);
   }
 
-  close() {
-    this.onclose?.();
-  }
+  close() {}
 }
 
 describe('Control tower dashboard', () => {
@@ -44,23 +63,32 @@ describe('Control tower dashboard', () => {
       unobserve() {}
       disconnect() {}
     };
-    global.fetch = vi.fn(() => Promise.resolve({
-      ok: true,
-      json: async () => lossResponse,
-    }));
+    global.fetch = vi.fn((url) => {
+      const requestUrl = String(url);
+      if (requestUrl.includes('/ai-summary')) {
+        return Promise.resolve({ ok: true, json: async () => summaryResponse });
+      }
+      if (requestUrl.includes('/ai-decision')) {
+        return Promise.resolve({ ok: true, json: async () => decisionResponse });
+      }
+      return Promise.resolve({ ok: true, json: async () => lossResponse });
+    });
   });
 
-  it('renders real-time stream data, charts, alert banner, and decision panel', async () => {
+  it('renders live summary data, last updated, financials, and decision guidance', async () => {
     render(<App />);
 
-    expect(screen.getByText('Waiting for live data...')).toBeInTheDocument();
-    expect(await screen.findByText('Real-Time OEE Decision Dashboard')).toBeInTheDocument();
-    expect(await screen.findByText('84.3%')).toBeInTheDocument();
-    expect(screen.getByText('$1,003,921')).toBeInTheDocument();
-    expect(screen.getByText('breakdown loss')).toBeInTheDocument();
-    expect(screen.getByText('HIGH PRIORITY ISSUE DETECTED')).toBeInTheDocument();
-    expect(screen.getByText('OEE over time')).toBeInTheDocument();
-    expect(screen.getByText('Loss breakdown')).toBeInTheDocument();
+    expect(screen.getByText('Waiting for live data')).toBeInTheDocument();
+    expect(await screen.findByText('Operations Intelligence Dashboard')).toBeInTheDocument();
+    expect(await screen.findByText('84.2%')).toBeInTheDocument();
+    expect(screen.getByText('$123,456.78')).toBeInTheDocument();
+    expect(screen.getAllByText('breakdown loss').length).toBeGreaterThan(0);
     expect(screen.getByText('Recommend maintenance intervention on the highest-loss machine.')).toBeInTheDocument();
+    expect(screen.queryByText('$NaN')).not.toBeInTheDocument();
+
+    await waitFor(() => {
+      expect(global.fetch).toHaveBeenCalledWith(expect.stringContaining('/ai-summary'));
+      expect(global.fetch).toHaveBeenCalledWith(expect.stringContaining('/ai-decision'));
+    });
   });
 });

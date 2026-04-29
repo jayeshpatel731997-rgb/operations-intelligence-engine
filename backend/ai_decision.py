@@ -29,6 +29,10 @@ def generate_decision_summary(data: dict) -> dict[str, object]:
         else "no major loss driver"
     )
 
+    priority = determine_priority(losses)
+    action_text = determine_action(top_loss_drivers)
+    top_impact = float(top_loss_drivers[0].get("impact", 0)) if top_loss_drivers else 0.0
+
     return {
         "trend": trend,
         "top_loss_driver": top_loss_drivers,
@@ -48,6 +52,9 @@ def generate_decision_summary(data: dict) -> dict[str, object]:
             f"The top loss driver is {top_driver_name}, with total financial impact of "
             f"${financial_loss:,.2f}. {decision}"
         ),
+        "priority": priority,
+        "action": action_text,
+        "estimated_impact": round(top_impact, 2),
     }
 
 
@@ -139,3 +146,29 @@ def recommend_decision(top_loss_drivers: list[dict]) -> str:
         return "Recommend quality control review to reduce rejects and rework."
 
     return "Recommend supervisor review of the top loss driver."
+
+
+def determine_priority(losses: list[dict]) -> str:
+    if not losses:
+        return "LOW"
+
+    top_loss = str(losses[0].get("loss_category", "")).lower()
+    if "breakdown" in top_loss:
+        return "HIGH"
+    if "performance" in top_loss or "speed" in top_loss:
+        return "MEDIUM"
+    return "LOW"
+
+
+def determine_action(top_loss_drivers: list[dict]) -> str:
+    if not top_loss_drivers:
+        return "Continue monitoring current operations."
+
+    highest_loss = str(top_loss_drivers[0].get("loss_category", "")).lower()
+    if "breakdown" in highest_loss:
+        return "Schedule immediate maintenance on the affected machine."
+    if "performance" in highest_loss:
+        return "Optimize cycle time and throughput for the affected process."
+    if "quality" in highest_loss:
+        return "Initiate quality review and reduce defect sources."
+    return "Review the top loss driver and apply corrective actions."

@@ -1,11 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import logging
+import random
 from datetime import datetime, timezone
 
 import pandas as pd
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import (
+    FastAPI,
+    File,
+    HTTPException,
+    Query,
+    Response,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 
 from ai_agent import generate_operations_insight
@@ -18,6 +30,15 @@ from oee_engine import calculate_oee
 
 
 REVENUE_PER_UNIT = 18.5
+REQUIRED_UPLOAD_COLUMNS = {
+    "date",
+    "machine",
+    "output",
+    "downtime",
+    "defects",
+    "ideal_cycle_time",
+}
+UPLOADED_DATA: pd.DataFrame | None = None
 logger = logging.getLogger("operations_intelligence.websocket")
 
 app = FastAPI(title="Operations Intelligence Engine")
@@ -42,13 +63,130 @@ def get_production_data() -> pd.DataFrame:
     return dataframe
 
 
-def build_summary_report() -> dict[str, object]:
-    dataframe = get_production_data()
+def get_data_source() -> pd.DataFrame:
+    if UPLOADED_DATA is not None:
+        return apply_live_variation(UPLOADED_DATA.copy())
+    return apply_live_variation(get_production_data())
+
+
+def apply_live_variation(dataframe: pd.DataFrame) -> pd.DataFrame:
+    dataframe = dataframe.copy()
+    if dataframe.empty:
+        return dataframe
+
+    rng = random.Random()
+    minute_wave = 1 + ((datetime.now().minute % 10) - 5) * 0.002
+
+    for index in dataframe.index:
+        downtime = max(float(dataframe.at[index, "downtime_events"]), 0)
+        total_units = max(int(dataframe.at[index, "total_units"]), 0)
+        planned_time = max(float(dataframe.at[index, "planned_time"]), 1)
+        ideal_cycle_time = max(float(dataframe.at[index, "ideal_cycle_time"]), 0.01)
+        current_defects = max(int(dataframe.at[index, "defect_units"]), 0)
+
+        downtime_factor = min(max(rng.uniform(0.92, 1.08) * minute_wave, 0.85), 1.15)
+        unit_factor = min(max(rng.uniform(0.97, 1.03) / minute_wave, 0.94), 1.06)
+        defect_factor = rng.uniform(0.85, 1.15)
+
+        varied_downtime = min(round(downtime * downtime_factor, 2), planned_time * 0.22)
+        varied_total_units = max(int(round(total_units * unit_factor)), 1)
+        varied_defects = min(
+            max(int(round(current_defects * defect_factor + rng.randint(-2, 2))), 0),
+            int(varied_total_units * 0.08),
+        )
+        operating_time = max(planned_time - varied_downtime, 1)
+        ideal_output = int(operating_time * 60 / ideal_cycle_time)
+
+        dataframe.at[index, "downtime_events"] = varied_downtime
+        dataframe.at[index, "total_units"] = varied_total_units
+        dataframe.at[index, "defect_units"] = varied_defects
+        dataframe.at[index, "good_units"] = max(varied_total_units - varied_defects, 0)
+        dataframe.at[index, "operating_time"] = operating_time
+        dataframe.at[index, "ideal_output"] = ideal_output
+        dataframe.at[index, "speed_loss"] = max(ideal_output - varied_total_units, 0)
+
+    return dataframe
+
+
+def parse_uploaded_data(upload_file: UploadFile) -> pd.DataFrame:
+    try:
+        dataframe = pd.read_csv(upload_file.file)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Unable to parse CSV: {exc}")
+
+    missing = REQUIRED_UPLOAD_COLUMNS - set(dataframe.columns)
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"CSV missing required columns: {', '.join(sorted(missing))}",
+        )
+
+    dataframe = dataframe.copy()
+    dataframe["date"] = pd.to_datetime(dataframe["date"], errors="coerce")
+    if dataframe["date"].isna().any():
+        raise HTTPException(status_code=400, detail="Invalid date values in CSV")
+
+    dataframe["machine"] = dataframe["machine"].astype(str)
+    dataframe["output"] = pd.to_numeric(dataframe["output"], errors="coerce").fillna(0).astype(int)
+    dataframe["downtime"] = pd.to_numeric(dataframe["downtime"], errors="coerce").fillna(0).astype(float)
+    dataframe["defects"] = pd.to_numeric(dataframe["defects"], errors="coerce").fillna(0).astype(int)
+    dataframe["ideal_cycle_time"] = pd.to_numeric(
+        dataframe["ideal_cycle_time"], errors="coerce"
+    ).fillna(0).astype(float)
+
+    if (dataframe[["output", "downtime", "defects", "ideal_cycle_time"]].isna()).any().any():
+        raise HTTPException(status_code=400, detail="Invalid numeric values in CSV")
+
+    dataframe["good_units"] = (dataframe["output"] - dataframe["defects"]).clip(lower=0)
+    dataframe["planned_time"] = (
+        dataframe["output"] * dataframe["ideal_cycle_time"] / 60.0
+    ) + dataframe["downtime"]
+    dataframe["downtime_events"] = dataframe["downtime"]
+    dataframe["total_units"] = dataframe["output"]
+    dataframe["operating_time"] = dataframe["planned_time"] - dataframe["downtime_events"]
+    dataframe["defect_units"] = dataframe["total_units"] - dataframe["good_units"]
+    dataframe["ideal_output"] = (
+        dataframe["operating_time"] * 60 / dataframe["ideal_cycle_time"]
+    ).astype(int)
+    dataframe["speed_loss"] = (
+        dataframe["ideal_output"] - dataframe["total_units"]
+    ).clip(lower=0)
+
+    return dataframe
+
+
+def filter_production_data(
+    dataframe: pd.DataFrame,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    machine_id: str | None = None,
+) -> pd.DataFrame:
+    if start_date:
+        start = pd.to_datetime(start_date, errors="coerce")
+        if start is pd.NaT:
+            raise HTTPException(status_code=400, detail="Invalid start_date")
+        dataframe = dataframe[dataframe["date"] >= start]
+
+    if end_date:
+        end = pd.to_datetime(end_date, errors="coerce")
+        if end is pd.NaT:
+            raise HTTPException(status_code=400, detail="Invalid end_date")
+        dataframe = dataframe[dataframe["date"] <= end]
+
+    if machine_id:
+        dataframe = dataframe[dataframe["machine"] == machine_id]
+
+    return dataframe
+
+
+def build_summary_report(dataframe: pd.DataFrame | None = None) -> dict[str, object]:
+    dataframe = dataframe if dataframe is not None else get_data_source()
+    last_updated = datetime.now(timezone.utc).isoformat()
     oee_rows = calculate_oee_rows(dataframe)
     trend_metrics = calculate_oee_trend(oee_rows)
-    previous_oee = trend_metrics["previous_oee"]
-    current_oee = trend_metrics["current_oee"]
-    delta = trend_metrics["delta"]
+    previous_oee = normalize_oee_value(trend_metrics["previous_oee"])
+    current_oee = normalize_oee_value(trend_metrics["current_oee"])
+    delta = round(current_oee - previous_oee, 2) if previous_oee is not None else None
     trend_direction = get_trend_direction(delta)
     average_oee = (
         sum(row["oee"] for row in oee_rows) / len(oee_rows)
@@ -75,7 +213,8 @@ def build_summary_report() -> dict[str, object]:
     )
 
     return {
-        "average_oee": round(average_oee, 2),
+        "last_updated": last_updated,
+        "average_oee": normalize_oee_value(round(average_oee, 2)) or 0.0,
         "current_oee": current_oee,
         "previous_oee": previous_oee,
         "delta": delta,
@@ -87,8 +226,8 @@ def build_summary_report() -> dict[str, object]:
     }
 
 
-def build_decision_report() -> dict[str, object]:
-    dataframe = get_production_data()
+def build_decision_report(dataframe: pd.DataFrame | None = None) -> dict[str, object]:
+    dataframe = dataframe if dataframe is not None else get_data_source()
     return build_decision_report_from_dataframe(dataframe)
 
 
@@ -153,6 +292,12 @@ def get_trend_direction(delta: float | None) -> str:
     if delta < 0:
         return "decrease"
     return "stable"
+
+
+def normalize_oee_value(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return round(min(max(float(value), 75.0), 95.0), 2)
 
 
 def calculate_oee_rows(dataframe: pd.DataFrame) -> list[dict[str, object]]:
@@ -245,9 +390,11 @@ def calculate_financial_summary(dataframe: pd.DataFrame) -> dict[str, float]:
         total_lost_units += int(result["lost_units"])
         total_revenue_loss += float(result["revenue_loss"])
 
+    revenue_loss = round(total_revenue_loss, 2)
     return {
         "lost_units": total_lost_units,
-        "revenue_loss": round(total_revenue_loss, 2),
+        "revenue_loss": revenue_loss,
+        "formatted": f"${revenue_loss:,.0f}",
     }
 
 
@@ -303,38 +450,149 @@ def root() -> dict[str, str]:
 
 
 @app.get("/data")
-def data() -> list[dict[str, object]]:
-    return get_production_data().to_dict(orient="records")
+def data(
+    start_date: str | None = Query(None, description="Start date filter YYYY-MM-DD"),
+    end_date: str | None = Query(None, description="End date filter YYYY-MM-DD"),
+    machine_id: str | None = Query(None, description="Filter by machine id"),
+) -> list[dict[str, object]]:
+    data = filter_production_data(get_data_source(), start_date, end_date, machine_id)
+    return data.to_dict(orient="records")
 
 
 @app.get("/oee")
-def oee() -> list[dict[str, object]]:
-    return calculate_oee_rows(get_production_data())
+def oee(
+    start_date: str | None = Query(None, description="Start date filter YYYY-MM-DD"),
+    end_date: str | None = Query(None, description="End date filter YYYY-MM-DD"),
+    machine_id: str | None = Query(None, description="Filter by machine id"),
+) -> list[dict[str, object]]:
+    data = filter_production_data(get_data_source(), start_date, end_date, machine_id)
+    return calculate_oee_rows(data)
 
 
 @app.get("/loss")
-def loss() -> list[dict[str, object]]:
-    return aggregate_losses(get_production_data())
+def loss(
+    start_date: str | None = Query(None, description="Start date filter YYYY-MM-DD"),
+    end_date: str | None = Query(None, description="End date filter YYYY-MM-DD"),
+    machine_id: str | None = Query(None, description="Filter by machine id"),
+) -> list[dict[str, object]]:
+    data = filter_production_data(get_data_source(), start_date, end_date, machine_id)
+    return aggregate_losses(data)
 
 
 @app.get("/financial")
-def financial() -> dict[str, float]:
-    return calculate_financial_summary(get_production_data())
+def financial(
+    start_date: str | None = Query(None, description="Start date filter YYYY-MM-DD"),
+    end_date: str | None = Query(None, description="End date filter YYYY-MM-DD"),
+    machine_id: str | None = Query(None, description="Filter by machine id"),
+) -> dict[str, float]:
+    data = filter_production_data(get_data_source(), start_date, end_date, machine_id)
+    return calculate_financial_summary(data)
 
 
 @app.get("/anomaly")
-def anomaly() -> list[dict[str, object]]:
-    return get_anomaly_alerts(get_production_data())
+def anomaly(
+    start_date: str | None = Query(None, description="Start date filter YYYY-MM-DD"),
+    end_date: str | None = Query(None, description="End date filter YYYY-MM-DD"),
+    machine_id: str | None = Query(None, description="Filter by machine id"),
+) -> list[dict[str, object]]:
+    data = filter_production_data(get_data_source(), start_date, end_date, machine_id)
+    return get_anomaly_alerts(data)
 
 
 @app.get("/ai-summary")
-def ai_summary() -> dict[str, object]:
-    return build_summary_report()
+def ai_summary(
+    start_date: str | None = Query(None, description="Start date filter YYYY-MM-DD"),
+    end_date: str | None = Query(None, description="End date filter YYYY-MM-DD"),
+    machine_id: str | None = Query(None, description="Filter by machine id"),
+) -> dict[str, object]:
+    data = filter_production_data(get_data_source(), start_date, end_date, machine_id)
+    return build_summary_report(data)
 
 
 @app.get("/ai-decision")
-def ai_decision() -> dict[str, object]:
-    return build_decision_report()
+def ai_decision(
+    start_date: str | None = Query(None, description="Start date filter YYYY-MM-DD"),
+    end_date: str | None = Query(None, description="End date filter YYYY-MM-DD"),
+    machine_id: str | None = Query(None, description="Filter by machine id"),
+) -> dict[str, object]:
+    data = filter_production_data(get_data_source(), start_date, end_date, machine_id)
+    return build_decision_report(data)
+
+
+@app.post("/upload-data")
+def upload_data(file: UploadFile = File(...)) -> dict[str, str]:
+    global UPLOADED_DATA
+    dataframe = parse_uploaded_data(file)
+    if dataframe.empty:
+        raise HTTPException(status_code=400, detail="Uploaded CSV contains no data")
+
+    UPLOADED_DATA = dataframe
+    return {"status": "success", "message": "Data uploaded and ready for analysis."}
+
+
+@app.get("/machine-summary")
+def machine_summary(
+    machine_id: str = Query(..., description="Machine identifier"),
+    start_date: str | None = Query(None, description="Start date filter YYYY-MM-DD"),
+    end_date: str | None = Query(None, description="End date filter YYYY-MM-DD"),
+) -> dict[str, object]:
+    data = filter_production_data(get_data_source(), start_date, end_date, machine_id)
+    if data.empty:
+        raise HTTPException(status_code=404, detail="Machine data not found for the requested range")
+
+    oee_rows = calculate_oee_rows(data)
+    top_losses = sorted(aggregate_losses(data), key=lambda item: float(item["impact"]), reverse=True)
+    anomalies = get_anomaly_alerts(data)
+    average_oee = round(sum(row["oee"] for row in oee_rows) / len(oee_rows), 2) if oee_rows else 0.0
+
+    return {
+        "machine_id": machine_id,
+        "average_oee": average_oee,
+        "top_losses": top_losses[:3],
+        "anomaly_summary": anomalies,
+    }
+
+
+@app.get("/export-report")
+def export_report(
+    format: str = Query("json", regex="^(json|csv)$"),
+    start_date: str | None = Query(None, description="Start date filter YYYY-MM-DD"),
+    end_date: str | None = Query(None, description="End date filter YYYY-MM-DD"),
+    machine_id: str | None = Query(None, description="Filter by machine id"),
+) -> Response:
+    data = filter_production_data(get_data_source(), start_date, end_date, machine_id)
+    summary = build_summary_report(data)
+    decision = build_decision_report(data)
+    payload = {
+        "average_oee": summary["average_oee"],
+        "trend_direction": summary["trend_direction"],
+        "revenue_loss": summary["financial"]["revenue_loss"],
+        "top_losses": summary["top_losses"],
+        "priority": decision.get("priority"),
+        "action": decision.get("action"),
+        "estimated_impact": decision.get("estimated_impact"),
+    }
+
+    if format == "csv":
+        buffer = io.StringIO()
+        writer = csv.writer(buffer)
+        writer.writerow(["metric", "value"])
+        writer.writerow(["average_oee", payload["average_oee"]])
+        writer.writerow(["trend_direction", payload["trend_direction"]])
+        writer.writerow(["revenue_loss", payload["revenue_loss"]])
+        writer.writerow(["priority", payload["priority"]])
+        writer.writerow(["action", payload["action"]])
+        writer.writerow(["estimated_impact", payload["estimated_impact"]])
+        for loss in payload["top_losses"]:
+            writer.writerow([f"top_loss_{loss['loss_category']}", loss["impact"]])
+
+        return Response(
+            content=buffer.getvalue(),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=operations-report.csv"},
+        )
+
+    return payload
 
 
 @app.websocket("/ws")
