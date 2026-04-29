@@ -1,16 +1,23 @@
 import React from 'react';
 import { Activity, AlertOctagon, DollarSign, Gauge, RadioTower } from 'lucide-react';
+import { BarChart, Bar, XAxis, YAxis, Tooltip } from 'recharts';
 import AlertBanner from '../components/AlertBanner.jsx';
 import DecisionPanel from '../components/DecisionPanel.jsx';
 import KPICard from '../components/KPICard.jsx';
 import LossChart from '../components/LossChart.jsx';
 import OEEChart from '../components/OEEChart.jsx';
 
-const API_BASE = (import.meta.env.VITE_API_BASE ?? 'http://localhost:8000').replace(/\/$/, '');
-const WS_PATH = '/ws';
-const WS_URL = normalizeWebSocketUrl(import.meta.env.VITE_WS_URL, API_BASE);
-const MAX_RECONNECT_ATTEMPTS = 5;
-const RECONNECT_DELAY_MS = 1500;
+const BASE_URL = "https://operations-intelligence-engine.onrender.com";
+
+const getSummary = async () => {
+  const res = await fetch(`${BASE_URL}/ai-summary`);
+  return await res.json();
+};
+
+const getLosses = async () => {
+  const res = await fetch(`${BASE_URL}/loss`);
+  return await res.json();
+};
 
 const initialStreamData = {
   timestamp: null,
@@ -57,13 +64,15 @@ function normalizeWebSocketUrl(configuredUrl, apiBase) {
   }
 }
 
-function formatCurrency(value) {
-  return Number(value || 0).toLocaleString('en-US', {
-    style: 'currency',
-    currency: 'USD',
-    maximumFractionDigits: 0,
-  });
+function formatCurrency(num) {
+  return `$${Number(num).toLocaleString()}`;
 }
+
+const getTrendColor = (trend) => {
+  if (trend === "increase") return "text-green-500";
+  if (trend === "decrease") return "text-red-500";
+  return "text-yellow-500";
+};
 
 function formatTime(timestamp) {
   if (!timestamp) return 'Not connected';
@@ -86,15 +95,6 @@ function safeParseJson(rawValue) {
   } catch {
     return null;
   }
-}
-
-async function fetchJson(path) {
-  const response = await fetch(`${API_BASE}${path}`);
-  if (!response.ok) {
-    throw new Error(`${path} request failed`);
-  }
-
-  return response.json();
 }
 
 function getTopLossName(topLossDriver) {
@@ -135,13 +135,33 @@ function useControlTowerStream() {
   const [oeeHistory, setOeeHistory] = React.useState([]);
   const [losses, setLosses] = React.useState(fallbackLosses);
   const [status, setStatus] = React.useState('connecting');
+  const [summaryData, setSummaryData] = React.useState(null);
+  const [decisionData, setDecisionData] = React.useState(null);
 
   const loadLosses = React.useCallback(async () => {
     try {
-      const nextLosses = await fetchJson('/loss');
+      const nextLosses = await getLosses();
       setLosses(Array.isArray(nextLosses) ? nextLosses : fallbackLosses);
     } catch {
       setLosses((current) => (Array.isArray(current) && current.length ? current : fallbackLosses));
+    }
+  }, []);
+
+  const loadSummary = React.useCallback(async () => {
+    try {
+      const summary = await getSummary();
+      setSummaryData(summary);
+    } catch (error) {
+      console.error('Failed to load summary:', error);
+    }
+  }, []);
+
+  const loadDecision = React.useCallback(async () => {
+    try {
+      const decision = await getDecision();
+      setDecisionData(decision);
+    } catch (error) {
+      console.error('Failed to load decision:', error);
     }
   }, []);
 
@@ -155,7 +175,7 @@ function useControlTowerStream() {
 
   const loadDecisionFallback = React.useCallback(async () => {
     try {
-      const report = await fetchJson('/ai-decision');
+      const report = await getDecision();
       const fallbackMessage = normalizeDecisionFallback(report);
       if (fallbackMessage) {
         applyStreamMessage(fallbackMessage);
@@ -176,6 +196,8 @@ function useControlTowerStream() {
     let reconnectAttempts = 0;
 
     loadLosses();
+    loadSummary();
+    loadDecision();
 
     const scheduleReconnect = () => {
       if (!isMounted) return;
@@ -215,6 +237,22 @@ function useControlTowerStream() {
         if (!isMounted) return;
         setStatus('fallback');
         loadDecisionFallback();
+
+        // fallback if websocket fails
+        setTimeout(async () => {
+          try {
+            const summary = await getSummary();
+            const decision = await getDecision();
+
+            setSummaryData(summary);
+            setDecisionData(decision);
+
+            console.log("Fallback API loaded");
+          } catch (err) {
+            console.error("Fallback failed", err);
+          }
+        }, 2000);
+
         socket?.close();
       };
 
@@ -233,13 +271,19 @@ function useControlTowerStream() {
       }
       socket?.close();
     };
-  }, [applyStreamMessage, loadDecisionFallback, loadLosses]);
+  }, [applyStreamMessage, loadDecisionFallback, loadLosses, loadSummary, loadDecision]);
 
-  return { streamData, oeeHistory, losses, status };
+  // Initial load useEffect
+  React.useEffect(() => {
+    loadSummary();
+    loadDecision();
+  }, []);
+
+  return { streamData, oeeHistory, losses, status, summaryData, decisionData };
 }
 
 export default function Dashboard() {
-  const { streamData, oeeHistory, losses, status } = useControlTowerStream();
+  const { streamData, oeeHistory, losses, status, summaryData, decisionData } = useControlTowerStream();
   const hasLiveData = streamData.timestamp !== null;
   const alertStatus = streamData.alert ? 'High priority' : status === 'live' ? 'Normal' : 'Connecting';
   const oeeValue = streamData.oee === null ? 'Waiting...' : `${Number(streamData.oee || 0).toFixed(1)}%`;
@@ -248,62 +292,92 @@ export default function Dashboard() {
   const anomalyText = streamData.anomaly || 'No anomaly data yet';
 
   return (
-    <main className="min-h-screen bg-slate-950 px-5 py-6 text-slate-100 sm:px-8">
-      <div className="mx-auto max-w-7xl">
-        <header className="mb-6 rounded-3xl border border-slate-800 bg-slate-900/80 p-6 shadow-xl shadow-slate-950/20">
-          <div className="flex justify-between items-center mb-4">
-            <div>
-              <h1 className="text-3xl font-bold text-white">
-                Operations Intelligence Control Tower
-              </h1>
-              <p className="text-gray-400">
-                Real-Time OEE | Anomaly Detection | AI Decision Engine
-              </p>
-            </div>
+    <div className="p-6 bg-slate-900 min-h-screen text-white">
+      {/* HEADER */}
+      <h1 className="text-3xl font-bold mb-6">
+        Operations Intelligence Dashboard
+      </h1>
+      <p className="text-gray-400 mb-6">
+        Real-time OEE tracking, anomaly detection, and AI-driven decision support system
+      </p>
 
-            <div className="text-green-400 font-semibold">
-              🟢 LIVE SYSTEM
-            </div>
-          </div>
-
-          <div className="mt-4 flex items-center justify-between gap-4 lg:flex-col lg:items-end">
-            <div className="rounded-lg border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-300">
-              <span className="font-semibold text-slate-100">Stream:</span> {status} |{' '}
-              <span className="font-semibold text-slate-100">Last update:</span> {formatTime(streamData.timestamp)}
-            </div>
-          </div>
-        </header>
-
-        {!hasLiveData && (
-          <section className="mb-5 rounded-lg border border-cyan-400/25 bg-cyan-400/10 p-4 text-cyan-100">
-            Waiting for live data...
-          </section>
-        )}
-
-        <AlertBanner alert={streamData.alert} anomaly={streamData.anomaly} />
-
-        <section className="mb-5 grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-          <KPICard title="OEE" value={oeeValue} detail="Current streamed OEE" icon={Gauge} tone="cyan" />
-          <KPICard title="Revenue Loss" value={revenueLoss} detail="Estimated current loss" icon={DollarSign} tone="amber" />
-          <KPICard title="Top Loss" value={topLoss} detail="Largest current loss driver" icon={Activity} tone="emerald" />
-          <KPICard title="Alert Status" value={alertStatus} detail={anomalyText} icon={AlertOctagon} tone={streamData.alert ? 'red' : 'cyan'} />
-        </section>
-
-        <section className="grid gap-5 lg:grid-cols-3">
-          <div className="lg:col-span-2">
-            <OEEChart points={oeeHistory} />
-          </div>
-          <LossChart losses={losses} />
-        </section>
-
-        <section className="mt-5">
-          <DecisionPanel decision={streamData.decision} anomaly={streamData.anomaly} />
-        </section>
-
-        <footer className="mt-10 text-center text-gray-500">
-          Built by Jayesh Patel | Supply Chain Analytics
-        </footer>
+      {/* SYSTEM STATUS */}
+      <div className="mb-4 flex items-center gap-2">
+        <div className="w-3 h-3 bg-green-500 rounded-full"></div>
+        <span className="text-sm text-gray-400">
+          System Live — Real-time Analytics Active
+        </span>
       </div>
-    </main>
+
+      {/* CRITICAL ISSUE ALERT */}
+      {summaryData?.top_losses?.[0] && (
+        <div className="bg-red-600 p-4 rounded-xl mb-6">
+          🚨 Critical Issue: {summaryData.top_losses[0].loss_category}
+        </div>
+      )}
+
+      {/* KPI GRID */}
+      {summaryData && (
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
+          <div className="bg-slate-800 p-5 rounded-xl shadow-lg">
+            <p className="text-gray-400">OEE</p>
+            <h2 className="text-3xl font-bold text-green-400">
+              {summaryData.average_oee}%
+            </h2>
+          </div>
+
+          <div className="bg-slate-800 p-5 rounded-xl shadow-lg">
+            <p className="text-gray-400">Revenue Loss</p>
+            <h2 className="text-3xl font-bold text-red-400">
+              {formatCurrency(summaryData.revenue_loss)}
+            </h2>
+          </div>
+
+          <div className="bg-slate-800 p-5 rounded-xl shadow-lg">
+            <p className="text-gray-400">Trend</p>
+            <h2 className={`text-3xl font-bold ${getTrendColor(summaryData.trend_direction)}`}>
+              {summaryData.trend_direction}
+            </h2>
+          </div>
+        </div>
+      )}
+
+      {/* CHART + AI */}
+      {summaryData && (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
+          {/* chart */}
+          <div className="bg-slate-800 p-5 rounded-xl shadow-lg">
+            <h3 className="text-xl font-bold mb-4">Loss Analysis</h3>
+            <BarChart width={400} height={250} data={summaryData.top_losses}>
+              <XAxis dataKey="loss_category" />
+              <YAxis />
+              <Tooltip />
+              <Bar dataKey="impact" />
+            </BarChart>
+          </div>
+
+          {/* AI summary */}
+          <div className="bg-slate-800 p-5 rounded-xl shadow-lg">
+            <h3 className="text-xl font-bold mb-4">AI Insights</h3>
+            <div className="text-gray-300">
+              {summaryData.summary_report}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* DECISION PANEL */}
+      {decisionData && (
+        <div className="bg-gradient-to-r from-purple-500 to-indigo-600 p-6 rounded-xl text-white shadow-xl">
+          <h2 className="text-xl font-bold mb-2">AI Recommendation</h2>
+          <p>{decisionData.summary_text}</p>
+        </div>
+      )}
+
+      {/* TECH STACK FOOTER */}
+      <p className="text-xs text-gray-500 mt-10">
+        Built using FastAPI, React, Machine Learning & deployed on cloud infrastructure
+      </p>
+    </div>
   );
 }
