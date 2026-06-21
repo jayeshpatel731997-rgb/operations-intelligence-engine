@@ -1,7 +1,11 @@
 fastapi
+starlette==0.41.3
 uvicorn
 python-multipart
 pydantic
+pydantic-settings
 pandas
 numpy
 scikit-learn
+reportlab
+pytest-asyncio
