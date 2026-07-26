@@ -4,8 +4,11 @@ uvicorn
 python-multipart
 pydantic
 pydantic-settings
+openai
 pandas
 numpy
 scikit-learn
 reportlab
+httpx
+pytest
 pytest-asyncio
